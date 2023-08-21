@@ -1,3 +1,7 @@
 V3Sweden_clean_otus_table.xlsx
 
 Contains the taxonomic assigment and OTU abundaces per sampling site. Detailed explanation in manuscript Inostroza et al., (REFS)
+
+sampling_sites.xlsx
+
+File contains metadata information such as sampling site names, environmental matrix, environmental parameters (e.g., nutrients, physicochemicals), and TU_MIC

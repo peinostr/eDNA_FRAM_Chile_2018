@@ -1,0 +1,1203 @@
+---
+title: "MicrobialCommunity16s_Aconcagua"
+author: "Dr. Pedro Inostroza"
+date: '`r Sys.Date()`'
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.path = "/Users/xinope/M_GU/R/RProjects/FRAM_16s_Chile/outputs/figures_rMD/", dev = c('pdf', 'png'))
+```
+
+### Standardtasks at the beginning
+```{r results="hide"}
+rm(list=ls()) #remove ALL objects 
+cat("\014") # clear console window prior to new run
+Sys.setenv(LANG = "en") #Let's keep stuff in English
+Sys.setenv("R_REMOTES_NO_ERRORS_FROM_WARNINGS"=TRUE)
+Sys.setlocale("LC_ALL")
+options(scipen = 999)
+options(dplyr.summarise.inform = FALSE)
+```
+
+### Libraries and paths
+```{r, results='hide', message=FALSE}
+packages<-c("tidyverse", "readxl", "vegan", "phyloseq", "QsRutils", "gridExtra", "data.table", "dunn.test", "microbiome","pairwiseAdonis", "tidytext", "DESeq2", "ggrepel", "eulerr", "microeco", "file2meco", "RColorBrewer", "ggpubr")
+lapply(packages, library, character.only=TRUE)
+
+inwd  <- "/Users/xinope/M_GU/R/RProjects/FRAM_16s_Chile/raw_data"
+outwd <- "/Users/xinope/M_GU/R/RProjects/FRAM_16s_Chile/outputs"
+setwd("/Users/xinope/M_GU/R/RProjects/FRAM_16s_Chile")
+```
+
+### Notes
+1) R1.s2 removed due to low sequencing depth (<5000 reads)
+2) Two samples missing due to sequencing issues (R1.s1 & R2.03sed)
+
+### Input Data
+```{r, results='hide', message=FALSE}
+# OTU table and taxonomy
+input<- read_excel(paste0(inwd, "/V3Sweden_clean_otus_table.xlsx"), col_names = TRUE, col_types = NULL)
+# Metadata
+samples<- read_delim(paste0(inwd, "/sampling_sites.csv"), locale=locale(decimal_mark = ","))
+```
+
+### Defining some functions
+```{r, results='hide', message=FALSE}
+geo_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+```
+
+### Environmental parameters
+Several parameters were recorded during the FRAM [Centre for Future Chemical Risk Assessment and Management Strategies](https://www.gu.se/en/fram-chemical-risk-assessment) field campaign in Chile 2018. Besides, the antibiotic pressure was included in the form of toxic units (TU_MIC).
+
+```{r, results='hide', message=F, warning=F, fig_env, fig.width= 6, fig.height=3}
+
+# Sub-setting sample input file
+parameter.order = c("TU_MIC","nitrate", "nitrite", "phosphate", "silicate", "temp", "light", "pH", "conductivity", "oxygen")
+
+env_vars <- samples %>%
+  mutate(sample_name = sample) %>%
+  mutate_at(vars("TU_MIC"), as.numeric) %>%
+  column_to_rownames(var = "sample") %>%
+  select(sample_name, site, label, type, matrix, all_of(parameter.order))
+
+# Define order of parameters
+combine.order = c("nitrate Reference", "nitrate River", "nitrate Tributary",
+                  "nitrite Reference", "nitrite River", "nitrite Tributary",
+                  "phosphate Reference", "phosphate River", "phosphate Tributary",
+                  "silicate Reference", "silicate River", "silicate Tributary",
+                  "temp Reference", "temp River", "temp Tributary",
+                  "light Reference", "light River", "light Tributary",
+                  "pH Reference", "pH River", "pH Tributary",
+                  "conductivity Reference", "conductivity River", "conductivity Tributary",
+                  "oxygen Reference", "oxygen River", "oxygen Tributary",
+                  "TU_MIC Reference", "TU_MIC River", "TU_MIC Tributary")
+
+# Plotting environmental parameters
+env_vars %>% select(matrix, type, nitrate, nitrite, phosphate, silicate, temp, light, pH, conductivity, oxygen, TU_MIC) %>%
+  pivot_longer(cols = all_of(parameter.order), names_to= "parameters", values_to= "values") %>%
+  filter(matrix == "Water") %>%
+  mutate(parameters = factor(parameters, levels = parameter.order)) %>%
+  unite(combine, parameters, type, sep= " ") %>%
+  mutate(combine = factor(combine, levels = combine.order)) %>%
+    ggplot(aes(x = combine, y = values, fill= combine)) +
+  geom_boxplot(outlier.color = NA, colour = "black", alpha = 0.4, lwd=0.3) +
+  labs(x = "Environmental parameters", y = "Units") +
+  scale_y_log10() +
+  theme_bw()+ theme(legend.position="none", strip.background = element_rect(colour="black", fill="white"))+
+  theme(strip.background = element_rect(colour="black", fill="white"))+
+  theme(axis.title.x=element_blank(), axis.text.x=element_text(angle=40,hjust=0.98,size=rel(1)), axis.text.y=element_text(size=rel(1)))
+
+# Statistics
+type.order<- c("Reference", "River", "Tributary")
+
+Stats.EnvVars<- env_vars %>% select(matrix, type, nitrate, nitrite, phosphate, silicate, temp, light, pH, conductivity, oxygen, TU_MIC) %>%
+  pivot_longer(cols = parameter.order, names_to= "parameters", values_to= "values") %>%
+  filter(matrix == "Water") %>%
+  mutate(parameters = factor(parameters, levels = parameter.order)) %>% 
+  mutate_at("values", as.numeric) %>%
+  mutate(type = factor(type, levels = type.order)) %>%
+  group_by(parameters)%>%
+  reframe(p.value = dunn.test(values, type, method= "bh")$P.adjusted)
+print(Stats.EnvVars)
+
+```
+
+Significant differences:
+
+- Nitrate significantly higher in tributary sites compared to reference sites (p-adjusted = 0.0380)
+- Nitrite significantly higher in river sites compared to reference sites (p-adjusted = 0.0365)
+- Conductivity significantly higher in tributary sites compared to reference sites (p-adjusted = 0.0380)
+- Oxygen significantly higher in river sites compared to reference sites (p-adjusted = 0.0380)
+- TU_MIC significantly higher in river sites compared to tributary sites (p-adjusted = 0.0344)
+
+## Microbial community analysis using phyloseq
+The amplicon  data (16s rRNA) was delivered as a table. The table has embedded the abundance of operational taxonomic units (OTUs) together with assigned taxonomy. Therefore, table was organised in two files in order to built the phyloseq object.
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+
+# data frame with only OTUs
+input_otu<- input %>% 
+  select(!taxonomy)%>%
+  column_to_rownames(var = "id")
+
+# data frame with sample ID and taxonomy
+input_tax<- input %>% 
+  select(id, taxonomy)%>%
+  separate(taxonomy, into=c("kingdom","phylum","class","order","family","genus","species"), sep=";", remove=TRUE, convert=TRUE)%>%
+  mutate(kingdom = gsub("k__", "", kingdom))%>%
+  mutate(phylum = gsub("p__", "", phylum))%>%
+  mutate(class = gsub("c__", "", class))%>%
+  mutate(order = gsub("o__", "", order))%>%
+  mutate(family = gsub("f__", "", family))%>%
+  mutate(genus = gsub("g__", "", genus))%>%
+  mutate(species = gsub("s__", "", species))%>%
+  mutate_all(na_if," ") %>%
+  column_to_rownames(var = "id")
+
+# transform data frames into matrices
+matrix_otu<-as.matrix(input_otu)
+matrix_tax<-as.matrix(input_tax)
+```
+
+#### Create phyloseq object
+
+phyloseq uses OTU table, taxonomy table, and metadata. OTUs unassigned at phylum levels were removed. In addition, chloroplast and mitocondria were also removed.
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+
+#transform to phyloseq object
+OTU_input = otu_table(matrix_otu, taxa_are_rows = TRUE)
+TAX_input = tax_table(matrix_tax)
+PHY_envars = sample_data(env_vars)
+
+#make phyloseq object
+OBJ_phyl<- phyloseq(OTU_input, TAX_input, PHY_envars)
+
+# remove uncharacterised, chloroplast, and mitochondria
+OBJ_phyl<- subset_taxa(OBJ_phyl, !is.na(phylum) & !phylum %in% c("","uncharacterized") & (class!="Chloroplast") & (family!="mitochondria"))
+
+# back-up as raw object
+OBJ_phyl_raw<-OBJ_phyl
+
+# clean up
+rm(input, input_otu, input_tax, matrix_otu, matrix_tax, samples, PHY_envars)
+```
+
+### Checking sequencing depth and removing samples with low reads.
+
+```{r, fig_depth, warning=FALSE, fig.width= 5, fig.height=4}
+
+# check sequencing depth
+OBJ_phyl_rare<- otu_table(OBJ_phyl)
+class(OBJ_phyl_rare) <- "matrix" 
+
+## you get a warning here, but this is what we need to have
+OBJ_phyl_rare <- t(OBJ_phyl_rare) # transpose observations to rows
+
+## plotting sequencing depth
+rarecurve(OBJ_phyl_rare, step=100, lwd=2, ylab="OTU", cex=0.75)
+
+# removing sample with low sequencing depth (<5000)
+OBJ_phyl = subset_samples(OBJ_phyl, sample_name != "R1.s2")
+```
+
+### Rarefaction and singletons
+
+We tested the role of rarefaction as well as singletons (OTUs present exactly once). Thus, the phyloseq object is filtered as follows:
+
+- OBJS1 = NO rarefaction + with singletons
+- OBJS2 = NO rarefaction + removed singletons
+- OBJS3 = rarefaction + with singletons
+- OBJS4 = rarefaction + removed singletons
+
+Each object will be used to estimate within sample diversity (alpha-diversity) and the results will be used to assess the role of rarefaction and singletons.
+
+```{r, warning=FALSE, message=FALSE}
+
+# OBJ_phyl = phyloseq object no rarefied
+# OBJ_phyl_rar = phyloseq object rarefied
+
+# rarefy without replacement
+OBJ_phyl_rare= rarefy_even_depth(OBJ_phyl, rngseed=1, sample.size=0.99*min(sample_sums(OBJ_phyl)), replace=F)
+
+# for OBJS1, OTUs with zero reads are removed
+OBJS1 <- prune_taxa(taxa_sums(OBJ_phyl) > 0, OBJ_phyl)
+OBJS2 <- filter_taxa(OBJ_phyl, function (x) {sum(x > 0) > 1}, prune=TRUE)
+OBJS3 <- OBJ_phyl_rare
+OBJS4 <- filter_taxa(OBJ_phyl_rare, function (x) {sum(x > 0) > 1}, prune=TRUE)
+```
+
+### Within sample diversity (alpha-diversity)
+
+We considered four diversity metrics: observed, Chao1, Shannon index, and evenness. Brief definition is provided:
+
+- Observed Taxa (Species richness) = Most simple metric. It just counts up the number of different taxa you observe in a sample at a given taxonomic level.
+- Chao1 = Estimate	diversity	from	abundance	data. It assumes	that	the	number	of	observations	for	a	taxa	has a	Poisson	distribution	and	corrects	for	variance
+- Shannon Index = Estimator for both species richness and evenness, but with weight on the richness. The idea behind this metric is that the more species you observe, and the more even their abundances are, the higher the entropy, or the higher the uncertainty of predicting which species you would see next if you were to look at another read from this sample
+
+```{r}
+
+indexes.order<- c("Observed", "Chao1", "Shannon")
+
+# Define a list of phyloseq objects
+phyloseq_objects <- list(OBJS1, OBJS2, OBJS3, OBJS4)
+
+# Initialize an empty list to store the results
+DFalpha_list <- list()
+
+# Loop through the phyloseq objects
+for (i in seq_along(phyloseq_objects)) {
+  DFalpha <- data.frame(
+    phyloseq::estimate_richness(phyloseq_objects[[i]], measures = indexes.order),
+    "Type" = phyloseq::sample_data(phyloseq_objects[[i]])$type,
+    "matrix" = phyloseq::sample_data(phyloseq_objects[[i]])$matrix,
+    "sample_name" = phyloseq::sample_data(phyloseq_objects[[i]])$label
+  )
+  
+  selected_cols <- c("sample_name", "Type", "matrix", "Observed", "Chao1", "Shannon")
+  
+  # Role of singletons was assessed.
+  DFalpha <- DFalpha %>%
+    select(all_of(selected_cols)) %>%
+    mutate(singleton = ifelse(i %% 2 == 1, "TRUE", "FALSE")) %>%
+    mutate(rarefaction = ifelse(i <= 2, "non_rarefied", "rarefied")) %>%
+    mutate(Dataset = paste0("OBJS", i))
+  
+  DFalpha_list[[i]] <- DFalpha
+}
+
+# Combine all the data frames in the list
+DFalphasets <- bind_rows(DFalpha_list)
+
+# Normality test
+DFalphasets %>%
+  group_by(rarefaction, singleton)%>%
+  summarise(statistic = shapiro.test(Observed)$statistic,
+            p.value = shapiro.test(Observed)$p.value)
+
+# summary normality
+# if p-value is < 0.05, then data is normally distributed
+# non-rarefied = non-normal -> non-parametric
+# rarefied = normal -> parametric
+
+rm(DFalpha_list, DFalpha, phyloseq_objects)
+```
+
+### alpha-diversity differences at different sampling sites.
+
+We assessed differences between the type of sampling sites for each environmental compartment. Type of sampling sites mean "Reference" vs "River" vs "Tributary" sites. Each type of sampling site is linked to land-uses within the River Aconcagua basin. 
+
+```{r}
+
+matrix.order<- c("Water", "Biofilm", "Sediment")
+dataset.order<- c("OBJS1", "OBJS2", "OBJS3", "OBJS4")
+
+# Type = Reference vs River vs Tributaries
+DFalphasets %>%
+  ungroup()%>%
+  pivot_longer(cols = all_of(indexes.order), names_to = "index", values_to = "values")%>%
+  select(-c(sample_name))%>%
+  mutate_at("values", as.numeric) %>%
+  mutate(matrix = factor(matrix, levels = matrix.order)) %>%
+  mutate(Type = factor(Type, levels = type.order)) %>%
+  mutate(index = factor(index, levels = indexes.order)) %>%
+  mutate(Dataset = factor(Dataset, levels = dataset.order)) %>%
+  group_by(Dataset, index, matrix)%>%
+  summarise(p_value = kruskal.test(values ~ Type)$p.value) %>%
+  filter(p_value < 0.05)
+
+```
+
+Overall, we did not find major differences for sampling sites types (i.e., reference, river, tributary) for each of the environmental compartments (i.e., water, biofilm, and sediment). These findings were consistent between the different datasets (OBJS1-OBJS4). Nevertheless, a discrepancy showed up for the sediment compartment and particularly the observed diversity metric between non-rarefied (OBJS1 & OBJS2) and rarefied data (OBJS3 & OBJS4). Reference sediments were significantly more diverse than river and tributary sediments in non-rarefied datasets (OBJS1 & OBJS2), while rarefied data showed no differences. See figure below.
+
+
+```{r, fig_alpha_comparison_matrix, fig.width= 9, fig.height=12}
+
+indexes.order2<- c("Observed","Chao1","Shannon","Evenness")
+
+combine_sites.order2 =c("Water Reference", "Water River", "Water Tributary",
+                        "Biofilm Reference", "Biofilm River", "Biofilm Tributary",
+                        "Sediment Reference", "Sediment River", "Sediment Tributary")
+
+DFalphasets %>%
+  mutate(Evenness= (Shannon/log(Observed)))%>%
+  pivot_longer(cols = all_of(indexes.order2), names_to = "index", values_to = "values")%>%
+  unite(combine_sites, matrix, Type, sep= " ", remove = FALSE) %>%
+  mutate(combine_sites = factor(combine_sites, levels = combine_sites.order2)) %>%
+  mutate_at(vars(index), factor, levels = indexes.order2) %>%
+  ggplot(aes(x = combine_sites, y = values, fill= combine_sites)) +
+  geom_boxplot(outlier.color = NA, colour = "black", alpha = 0.4, lwd=0.3) +
+  scale_fill_manual(values=c("#009E73", "#56B4E9", "#E69F00", "#009E73", "#56B4E9", "#E69F00", "#009E73", "#56B4E9", "#E69F00"))+
+  geom_jitter(aes(shape= matrix), alpha = 0.5, size = 2, width = 1) +
+  labs(x = "", y = "", title = "A) alpha-diversity per sampling type") +
+  facet_wrap( Dataset ~ index, scales = "free", ncol = 4) +
+  theme_bw()+ #theme(legend.position="none", strip.background = element_rect(colour="black", fill="white"))+
+  theme(strip.background = element_rect(colour="black", fill="white"))+
+  theme(axis.title.x=element_blank(), axis.text.x=element_text(angle=40,hjust=0.98,size=rel(1)), axis.text.y=element_text(size=rel(1)))
+
+rm(OBJS2, OBJS3, OBJS4, OBJ_phyl, OBJ_phyl_raw, OBJ_phyl_rare)
+
+```
+
+#### Remarks regarding rarefaction and singletons
+
+Overall, no major differences were determined between the four tested scenarios. Singletons did not affect the alpha-diversity outputs therefore scenarios considering singletons are selected (OBJS1 & OBJS3) for further downstream analysis. This decision comprises not excluding any data. However, we observed that rarefaction created distinct results only for the sediment compartment (see above). Finally, OBJS1 is selected for further downstream analysis.
+
+Biological data can be rarefied to account for the differences in library size and heteroscedasticity (unequal variability between samples) within a dataset. However, rarefying biological count data is statistically inadmissible. It requires the omission of available valid data, which leads to a loss of power or decreased sensitivity (increase in Type-II error). This is evident in sample-wise comparisons when fractions of a sample or even whole samples are discarded to generate rarefied counts but also in differential abundance analysis which expects the inclusion of moderate to rare ASVs that are more likely to be part of the omitted data. Additionally, rarefying does not address overdispersion among biological replicates which results in an underestimation of uncertainty due to an unacceptably high rate of Type-I errors and therefore, decreased specificity. Furthermore, the selection of the minimum threshold for the library size is arbitrary which influences downstream inference. Finally, the random subsampling step in rarefying adds additional uncertainty to the biological data (McMurdie und Holmes [2014](https://doi.org/10.1371/journal.pcbi.1003531)).
+
+### Bacterial composition
+
+```{r, fig.composition, fig.width= 12, fig.height=4 }
+
+#Convert to relative abundance
+OBJS1rel = phyloseq::transform_sample_counts(OBJS1, function(x){x / sum(x)})
+
+# phyloseq object must be converted to dataframe for plotting
+DFOBJS1rel <- psmelt(OBJS1rel)
+
+sample.order<- c("RS1.s1","RS1.s2","RS2.s1","RS2.s2","RS3.s1","RS3.s2","R1.s2","R2.s1","R2.s2","R3.s1","R3.s2","T1.s1","T1.s2","T2.s1","T2.s2","T3.s1","T3.s2","RS1.01sed","RS1.02sed","RS1.03sed","RS2.01sed","RS2.02sed","RS2.03sed","RS3.01sed","RS3.02sed","RS3.03sed","R1.01sed","R1.02sed","R1.03sed","R2.01sed","R2.02sed","R3.01sed","R3.02sed","R3.03sed","T1.01sed","T1.02sed","T1.03sed","T2.01sed","T2.02sed","T2.03sed","T3.01sed","T3.02sed","T3.03sed","RS1.eDNA","RS2.eDNA","RS3.eDNA","R1.eDNA","R2.eDNA","R3.eDNA","T1.eDNA","T2.eDNA","T3.eDNA")
+
+# Plotting community composition at phylum level
+DFOBJS1rel %>% mutate_at(vars(Sample), factor, levels = sample.order) %>%
+  mutate_at(vars(matrix), factor, levels = matrix.order) %>%
+ggplot(aes(x= factor(Sample), y=Abundance, fill=phylum))+
+  geom_bar(aes(color = phylum, fill = phylum), stat = "identity", position = "stack") +
+  labs(x = "", y = "Relative Abundance\n", title = "Bacterial community composition") +
+  facet_wrap( ~ matrix, ncol= 3, scales = "free") +
+  theme_bw()+ theme(strip.background = element_rect(colour="black", fill="white"))+
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_text(angle=40,hjust=0.98,size=rel(1)),
+        axis.text.y=element_text(size=rel(1)))
+
+rm(DFOBJS1rel)
+
+```
+
+Four phyla dominated the composition of the bacterial communities. Proteobacteria, Bacteroidetes, and Actinobacteria in all environmental compartments. Cyanobacteria only in the biofilm compartment (see below).
+
+### Most abundant phyla - composition
+
+```{r, fig.dominant_phyla, fig.width=8, fig.height=3, results='hide'}
+
+#Agglomerate to phylum-level and rename
+
+OBJS1rel_diff <- phyloseq::tax_glom(OBJS1rel, "phylum")
+phyloseq::taxa_names(OBJS1rel_diff) <- phyloseq::tax_table(OBJS1rel_diff)[, "phylum"]
+
+my_comparisons <- list( c("Water", "Biofilm"), c("Water", "Sediment"), c("Biofilm", "Sediment") )
+
+# specific phyla (most abundant)
+phyloseq::psmelt(OBJS1rel_diff) %>%
+  filter(phylum %in% c(" Actinobacteria", " Bacteroidetes", " Cyanobacteria", " Proteobacteria")) %>%
+  mutate_at(vars(matrix), factor, levels = matrix.order) %>%
+  ggplot(data = ., aes(x = matrix, y = Abundance)) +
+  geom_point(aes(shape=type, colour= type), position = "jitter", size = 2) +
+  #scale_fill_manual(values = c("#009E73", "#56B4E9", "#E69F00"))+
+  stat_summary(fun= median, geom="crossbar", width=1, color="black") +
+  #stat_compare_means(comparisons = my_comparisons, label.y = c(0.7, 0.8, 0.9))+
+  stat_compare_means(comparisons = my_comparisons, label = "p.signif")+
+  labs(x = "", y = "Relative Abundance\n") +
+  facet_wrap(~ phylum, scales = "free", ncol = 5)+
+  theme_bw()+ theme(strip.background = element_rect(colour="black", fill="white"))+
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_text(angle=40,hjust=0.98,size=rel(1)),
+        axis.text.y=element_text(size=rel(1)))
+
+# statistics
+phyloseq::psmelt(OBJS1rel_diff) %>%
+  filter(phylum %in% c(" Actinobacteria", " Bacteroidetes", " Cyanobacteria", " Proteobacteria")) %>%
+  mutate_at(vars(matrix), factor, levels = matrix.order) %>%
+  select(phylum, Abundance, label, type, matrix) %>%
+  mutate_at("Abundance", as.numeric) %>%
+  group_by(phylum)%>%
+  reframe(p.value = dunn.test(Abundance, matrix, method= "bh")$P.adjusted)
+
+rm(my_comparisons, OBJS1rel_diff)
+```
+
+### Venn diagram (unique and shared OTUs)
+
+```{r, fig.venn, fig.width=8, fig.height=3}
+
+# Create new objects based on environmental matrix
+wat_phy <- subset_samples(OBJS1, matrix == "Water")
+sed_phy <- subset_samples(OBJS1, matrix == "Sediment")
+bio_phy <- subset_samples(OBJS1, matrix == "Biofilm")
+
+# convert to relative abundances each matrix
+Wpseq.rel <- microbiome::transform(wat_phy, "compositional")
+Spseq.rel <- microbiome::transform(sed_phy, "compositional")
+Bpseq.rel <- microbiome::transform(bio_phy, "compositional")
+
+#make a list of sampling site types
+type <- unique(as.character(meta(Wpseq.rel)$type))
+
+# Specify colors in the order they appear in list_core
+mycols_type <- c(Reference="#00d99e", River="#00a8d9", Tributary="#E69F00") 
+
+#Write a for loop to go through the type category and combine identified core taxa into a list
+#Loop for Water
+WaterUnique <- c() # an empty object to store information
+
+for (n in type){ # for each variable n in water phyloseq object
+  Wps.sub <- subset_samples(Wpseq.rel, type == n) # Choose sample from object
+  
+  Wcore_m <- core_members(Wps.sub, # ps.sub is phyloseq selected with only samples from g 
+                          detection = 0.0001, # 0.0001 in at least 99% samples 
+                          prevalence = 0.75)
+  print(paste0("No. of core taxa in ", n, " : ", length(Wcore_m))) # print core taxa identified in each matrix
+  WaterUnique[[n]] <- Wcore_m # add to a list core taxa for each group.
+}
+
+#Loop for Biofilm
+BioUnique <- c() # an empty object to store information
+
+for (n in type){ # for each variable n in water phyloseq object
+  Bps.sub <- subset_samples(Bpseq.rel, type == n) # Choose sample from object
+  
+  Bcore_m <- core_members(Bps.sub, # ps.sub is phyloseq selected with only samples from g 
+                          detection = 0.0001, # 0.0001 in at least 99% samples 
+                          prevalence = 0.75)
+  print(paste0("No. of core taxa in ", n, " : ", length(Bcore_m))) # print core taxa identified in each matrix
+  BioUnique[[n]] <- Bcore_m # add to a list core taxa for each group.
+  #print(list_core)
+}
+
+#Loop for Sediment
+SedUnique <- c() # an empty object to store information
+
+for (n in type){ # for each variable n in water phyloseq object
+  Sps.sub <- subset_samples(Spseq.rel, type == n) # Choose sample from object
+  
+  Score_m <- core_members(Sps.sub, # ps.sub is phyloseq selected with only samples from g 
+                          detection = 0.0001, # 0.0001 in at least 99% samples 
+                          prevalence = 0.75)
+  print(paste0("No. of core taxa in ", n, " : ", length(Score_m))) # print core taxa identified in each matrix
+  SedUnique[[n]] <- Score_m # add to a list core taxa for each group.
+  #print(list_core)
+}
+
+# plotting Venn
+Wvenn<- plot(venn(WaterUnique), fills = mycols_type)
+Bvenn<- plot(venn(BioUnique), fills = mycols_type)
+Svenn<- plot(venn(SedUnique), fills = mycols_type)
+
+grid.arrange(Wvenn, Bvenn, Svenn, ncol = 3)
+
+rm(BioUnique, SedUnique, WaterUnique, Bps.sub, Bpseq.rel, Sps.sub, Spseq.rel, Wps.sub, Wpseq.rel, Wvenn, Bvenn, Svenn)
+```
+
+Each compartment showed a distinct pattern regarding the number of core OTUs. Water-OTUs had the highest abundances at tributary sites and the lowest at the main course of the river. The main course of the river showed the lowest number of unique OTUs (n=38) as well as the lowest shared OTUs with the reference sites (n=6). Conversely, biofilm-OTUs showed the lowest core OTUs in tributary sites and the highest in the main river course. Finally, sediments had similar numbers of core OTUs within the river basin. Although, tributary had the lowest number of unique OTUs like biofilms.
+
+### Between sample diversity (beta-diversity)
+
+We applied a compositional beta diversity metric rooted in a centered log-ratio transformation (clr-transformation). By accounting for the sparse compositional nature of microbiome data sets, robust Aitchison PCA can yield high discriminatory power and salient feature ranking between microbial niches (Martino et al., [2019](https://doi.org/10.1128/mSystems.00016-19)).
+
+```{r, fig.beta, fig.width=8, fig.height=3, results='hide'}
+
+# Euclidean distance of clr-transformed compositions (called the Aitchison distance)
+(OBJS1rclr <- microbiome::transform(OBJS1, transform= "rclr"))
+
+# Generate distance matrix - Euclidean distances
+OBJS1rclrdist<- phyloseq::distance(OBJS1rclr, method = "euclidean")
+
+# betadisper is a multivariate analogue of Levene's test for homogeneity of variances
+# This procedure has latterly been used as a means of assessing beta diversity.
+# Two distance matrices were calculated based on: 1) environmental compartment ("matrix") and type of sampling site ("type")
+dispr_matrix <- vegan::betadisper(OBJS1rclrdist, phyloseq::sample_data(OBJS1rclr)$matrix)
+dispr_type <- vegan::betadisper(OBJS1rclrdist, phyloseq::sample_data(OBJS1rclr)$type)
+
+# eigen values environmental compartments (water, biofilm, sediment)
+sapply(dispr_matrix$eig[1:5], function(x) x / sum(dispr_matrix$eig))
+# eigen values sampling site type (reference, tributary, river)
+sapply(dispr_type$eig[1:5], function(x) x / sum(dispr_type$eig))
+
+#Scale axes and plot ordination
+eig1_matrix <- (dispr_matrix$eig[1] / sum(dispr_matrix$eig))*100
+eig2_matrix <- (dispr_matrix$eig[2] / sum(dispr_matrix$eig))*100
+
+eig1_type <- (dispr_type$eig[1] / sum(dispr_type$eig))*100
+eig2_type <- (dispr_type$eig[2] / sum(dispr_type$eig))*100
+
+# extract the centroids and the site points in multivariate space.  
+centroids_matrix<- data.frame(grps=rownames(dispr_matrix$centroids), data.frame(dispr_matrix$centroids))
+vectors_matrix<- data.frame(group= dispr_matrix$group, data.frame(dispr_matrix$vectors ))
+
+centroids_type<- data.frame(grps=rownames(dispr_type$centroids), data.frame(dispr_type$centroids))
+vectors_type<- data.frame(group= dispr_type$group, data.frame(dispr_type$vectors ))
+
+# rearrange sites for further plotting
+rank_matrix <- c("Biofilm","Sediment", "Water")
+vectors_matrix<- vectors_matrix %>% arrange(sapply(group, function(y) which(y == rank_matrix)))
+
+rank_type <- c("Reference","Tributary", "River")
+vectors_type<- vectors_type %>% arrange(sapply(group, function(y) which(y == rank_type)))
+
+# to create the lines from the centroids to each point we will put it in a format that ggplot can handle
+seg.matrix<- cbind(vectors_matrix[,1:3], centroids_matrix[rep(1:nrow(centroids_matrix),as.data.frame(table(vectors_matrix$group))$Freq),2:3])
+names(seg.matrix)<-c("group","v.PCoA1","v.PCoA2","PCoA1","PCoA2")
+
+seg.type<- cbind(vectors_type[,1:3], centroids_type[rep(1:nrow(centroids_type),as.data.frame(table(vectors_type$group))$Freq),2:3])
+names(seg.type)<-c("group","v.PCoA1","v.PCoA2","PCoA1","PCoA2")
+
+# create the convex hulls of the outermost points
+grp1.wat<-seg.matrix[seg.matrix$group=="Water",1:3][chull(seg.matrix[seg.matrix$group=="Water",2:3]),]
+grp2.sed<-seg.matrix[seg.matrix$group=="Sediment",1:3][chull(seg.matrix[seg.matrix$group=="Sediment",2:3]),]
+grp3.bio<-seg.matrix[seg.matrix$group=="Biofilm",1:3][chull(seg.matrix[seg.matrix$group=="Biofilm",2:3]),]
+all.matrix<-rbind(grp1.wat, grp2.sed, grp3.bio)
+
+grp1.ref<-seg.type[seg.type$group=="Reference",1:3][chull(seg.type[seg.type$group=="Reference",2:3]),]
+grp2.tri<-seg.type[seg.type$group=="Tributary",1:3][chull(seg.type[seg.type$group=="Tributary",2:3]),]
+grp3.riv<-seg.type[seg.type$group=="River",1:3][chull(seg.type[seg.type$group=="River",2:3]),]
+all.type<-rbind(grp1.ref, grp2.tri, grp3.riv)
+
+# rowname to first columns for further plotting
+setDT(seg.matrix, keep.rownames = TRUE)[]
+setDT(seg.type, keep.rownames = TRUE)[]
+
+beta_matrix<-ggplot() + 
+  geom_polygon(data=all.matrix[all.matrix=="Water",],aes(x=v.PCoA1,y=v.PCoA2),colour="#0000ff",alpha=0,linetype="solid") +
+  geom_polygon(data=all.matrix[all.matrix=="Sediment",],aes(x=v.PCoA1,y=v.PCoA2),colour="#8b4513",alpha=0,linetype="solid") +
+  geom_polygon(data=all.matrix[all.matrix=="Biofilm",],aes(x=v.PCoA1,y=v.PCoA2),colour="#32cd32",alpha=0,linetype="solid") +
+  geom_segment(data=seg.matrix,aes(x= v.PCoA1, xend=PCoA1, y=v.PCoA2, yend=PCoA2),alpha=0.30) + 
+  geom_point(data=centroids_matrix[,1:3], aes(x=PCoA1,y=PCoA2, shape=grps, color= grps), size=4) + 
+  scale_color_manual(values=c("#32cd32", "#8b4513", "#0000ff"))+
+  geom_text(data=centroids_matrix[,1:3], aes(x=PCoA1,y=PCoA2,label=grps),hjust=-0.2, vjust=-1.5, size=3)+
+  geom_point(data=seg.matrix, aes(x=v.PCoA1,y=v.PCoA2, shape=group), size=2, alpha= 0.30) +
+  geom_text(data=seg.matrix, aes(x=v.PCoA1,y=v.PCoA2,label=rn),hjust=-0.2, vjust=-1.5, size=3)+
+  labs(title="A) Beta-diversity based on environmental matrix") +
+  labs(x = paste("PCoA 1 (", round(eig1_matrix[[1]],1), "%", ")", sep = ""),
+       y = paste("PCoA 2 (", round(eig2_matrix[[1]],1), "%", ")", sep = ""))+
+  coord_cartesian(xlim = c(-30, 40), ylim = c(-30, 30)) +
+  theme_bw()+
+  theme(legend.position="none")
+
+beta_sites<- ggplot() + 
+  geom_polygon(data=all.type[all.type=="River",],aes(x=v.PCoA1,y=v.PCoA2),colour="#0000ff",alpha=0,linetype="solid") +
+  geom_polygon(data=all.type[all.type=="Tributary",],aes(x=v.PCoA1,y=v.PCoA2),colour="#8b4513",alpha=0,linetype="solid") +
+  geom_polygon(data=all.type[all.type=="Reference",],aes(x=v.PCoA1,y=v.PCoA2),colour="#32cd32",alpha=0,linetype="solid") +
+  geom_segment(data=seg.type, aes(x= v.PCoA1, xend=PCoA1, y=v.PCoA2, yend=PCoA2),alpha=0.30) + 
+  geom_point(data= centroids_type[,1:3], aes(x=PCoA1,y=PCoA2, shape=grps, color= grps), size=4) + 
+  scale_color_manual(values=c("#32cd32", "#0000ff", "#8b4513"))+
+  geom_text(data= centroids_type[,1:3], aes(x=PCoA1,y=PCoA2,label=grps),hjust=-0.2, vjust=-1.5, size=3)+
+  geom_point(data= seg.type, aes(x=v.PCoA1,y=v.PCoA2, shape=group), size=2, alpha= 0.30) +
+  geom_text(data= seg.type, aes(x=v.PCoA1,y=v.PCoA2,label=rn),hjust=-0.2, vjust=-1.5, size=3)+
+  labs(title="B) Beta-diversity based on sampling sites") +
+  labs(x = paste("PCoA 1 (", round(eig1_type[[1]],1), "%", ")", sep = ""),
+       y = paste("PCoA 2 (", round(eig2_type[[1]],1), "%", ")", sep = ""))+
+  coord_cartesian(xlim = c(-30, 40), ylim = c(-30, 30)) +
+  theme_bw()+
+  theme(legend.position="none")
+
+grid.arrange(beta_matrix, beta_sites, ncol = 2)
+
+rm(grp1.ref, grp1.wat, grp2.sed, grp2.tri, grp3.bio, grp3.riv, centroids_matrix, centroids_type, vectors_matrix, vectors_type, seg.matrix, seg.type, all.matrix, all.type)
+```
+
+### Permutational analysis of variance (PERMANOVA)
+
+PERMANOVA is a widely used non-parametric multivariate method that can be used to estimate the actual statistical significance of differences in the observed community composition between two groups of samples. PERMANOVA evaluates the hypothesis that the centroids and dispersion of the community are equivalent between the compared groups. A small p-value indicates that the compared groups have, on average, a different community composition.
+
+```{r}
+
+#ADONIS test (environmental matrices)
+pairwise.adonis(OBJS1rclrdist, phyloseq::sample_data(OBJS1rclr)$matrix, p.adjust.m = "BH", perm = 999)
+
+```
+
+Since the environmental compartment are different, there is not statistical support to consider the community as a whole and thus we split the data. We assess if the distance between sampling sites is relevant in the struxturing of the bacterial communities in water, biofilm, and sediment.
+
+```{r, results='hide'}
+
+# subset per matrix
+OBJwater<- subset_samples(OBJS1, matrix == "Water")
+OBJbiofilm<- subset_samples(OBJS1, matrix == "Biofilm")
+OBJsed<- subset_samples(OBJS1, matrix == "Sediment")
+
+# Aitchison distance
+(OBJwater <- microbiome::transform(OBJwater, transform= "rclr"))
+(OBJbiofilm <- microbiome::transform(OBJbiofilm, transform= "rclr"))
+(OBJsed <- microbiome::transform(OBJsed, transform= "rclr"))
+
+rOBJwaterdist<- phyloseq::distance(OBJwater, method = "euclidean")
+rOBJbiofilmdist<- phyloseq::distance(OBJbiofilm, method = "euclidean")
+rOBJseddist<- phyloseq::distance(OBJsed, method = "euclidean")
+```
+
+### PERMANOVA between sampling site per each environmental compartment
+
+Multiple comparison between reference, tributary, and river sites per each environmental compartment.
+
+```{r, message=FALSE}
+
+# Water
+pairwise.adonis(rOBJwaterdist, phyloseq::sample_data(OBJwater)$type, p.adjust.m = "BH", perm = 999)
+
+# Biofilm
+pairwise.adonis(rOBJbiofilmdist, phyloseq::sample_data(OBJbiofilm)$type, p.adjust.m = "BH", perm = 999)
+
+# Sediment
+pairwise.adonis(rOBJseddist, phyloseq::sample_data(OBJsed)$type, p.adjust.m = "BH", perm = 999)
+
+rm(beta_matrix, beta_sites, dispr_matrix, dispr_type, OBJS1rclr)
+
+```
+
+#### Remarks regarding beta-diversity
+
+- Water, biofilm, and sediment bacterial communities are significantly different between each other.
+- No significant differences in the water compartment. Likely due to poor replication.
+- River and tributary sites different to reference in the biofilm compartment.
+- All sediment sites different between each other.
+ 
+### Role of environmental variables shaping bacterial community structure.
+
+we performed a distance-based redundancy analysis (dbRDA) to generate a constrained ordination diagram, using the significant main effects and interaction terms determined from the PERMANOVA analysis as categorical predictor variables (Anderson et al. 2008). Distance-based redundancy analysis is a direct analogue to traditional redundancy analysis (RDA), but is more flexible in that it can be used with non-Euclidean measures of distance (such as Bray–Curtis dissimilarity) that are often more appropriate for the analysis of ecological data (Legendre & Anderson 1999). dbRDA was conducted only in biofilm and sediments compartments since these were the compartment showing significant variation between sampling sites.
+
+```{r, results='hide'}
+
+# Objects already subsetted and clr-transformed (see above)
+OBJbiofilm
+OBJsed
+
+# RDA or dbRDA work using a dataframe of OTUs and environmental variables from the phyloseq object
+# extract the OTU table
+Y_bio <- veganotu(OBJbiofilm)
+Y_sed <- veganotu(OBJsed)
+
+# extract the sample data from the 'phyloseq' object
+DT_bio <- data.frame(sample_data(OBJbiofilm))
+DT_sed <- data.frame(sample_data(OBJsed))
+
+# continuous (numeric) variables
+DT_bio_num <- select_if(DT_bio, is.numeric)
+DT_sed_num <- select_if(DT_sed, is.numeric)
+
+# select the continuous (numeric) variables to use in the constraint (Y) then standardise
+X_bio <- decostand(DT_bio_num, method='hellinger')
+X_sed <- decostand(DT_sed_num, method='hellinger')
+
+```
+
+We tested which distance metric suits the best our data. Euclidean distances were ranked the highest and thus used as distance index within the dbRDA.
+
+```{r, warning=FALSE}
+# distances
+rankindex(X_bio, Y_bio, indices = c("euc", "man", "gow","bra", "kul"), stepacross= FALSE, method = "spearman")
+rankindex(X_sed, Y_sed, indices = c("euc", "man", "gow","bra", "kul"), stepacross= FALSE, method = "spearman")
+
+# note the result is the same as for RDA when using euclidean distances
+res_bio <- capscale(Y_bio ~ ., data=X_bio, distance= 'euc')
+res_sed <- capscale(Y_sed ~ ., data=X_sed, distance= 'euc')
+
+# summary of the results
+summary(res_bio, display=NULL)
+summary(res_sed, display=NULL)
+
+# Testing the level of significance of the biofilm and sediment dbRDA models
+anova.cca(res_bio, perm.max=999)
+anova.cca(res_sed, perm.max=999)
+
+# by environmental variables
+anova.cca(res_bio, by= "terms", perm.max=999) 
+anova.cca(res_sed, by= "terms", perm.max=999) 
+
+# New model using only significant variables
+bio_sig<- capscale(Y_bio~ nitrate+nitrite+silicate+temp+light, data= X_bio, distance= 'euc')
+sed_sig<- capscale(Y_sed~ TU_MIC + nitrate + nitrite + phosphate + silicate + temp + light + pH, data= X_sed, distance= 'euc')
+
+# Testing the level of significance of the biofilm and sediment dbRDA models
+anova.cca(bio_sig, perm.max=999)
+anova.cca(sed_sig, perm.max=999)
+
+# by environmental variables
+anova.cca(bio_sig, by= "terms", perm.max=999) 
+anova.cca(sed_sig, by= "terms", perm.max=999) 
+
+# final models
+bio_sig<- capscale(Y_bio~ nitrate+light, data= X_bio, distance= 'euc')
+sed_sig<- capscale(Y_sed~ TU_MIC + nitrate + nitrite + phosphate + silicate + temp + light + pH, data= X_sed, distance= 'euc')
+
+# summary of the results
+summary(bio_sig, display=NULL)
+summary(sed_sig, display=NULL)
+
+rm(X_bio, X_sed, Y_bio, Y_sed, DT_bio_num, DT_sed_num, res_bio, res_sed)
+
+```
+
+The models were reduced 
+
+```{r, fig_dbrda_basic, warning=FALSE, fig.width=8, fig.height=3}
+
+# exploratory plots
+plot(bio_sig, scaling=2, type= "text")
+plot(sed_sig, scaling=2, type= "text")
+
+```
+
+#### Replotting dbRDA using ggplot
+
+```{r, fig_dbrda, warning=FALSE, fig.width=8, fig.height=3}
+
+# extract % explained by the first two axes
+perc_bio <- round(100*(summary(bio_sig)$cont$importance[2, 1:2]), 2)
+perc_sed <- round(100*(summary(sed_sig)$cont$importance[2, 1:2]), 2)
+
+## extract scores - these are coordinates in the RDA space
+sit_bio <- cbind(DT_bio, scores(bio_sig, display= 'sites'))
+sit_sed <- cbind(DT_sed, scores(sed_sig, display= 'sites'))
+
+spp_bio <- cbind(data.frame(tax_table(OBJbiofilm)), scores(bio_sig, display='species'))
+spp_sed <- cbind(data.frame(tax_table(OBJsed)), scores(sed_sig, display='species'))
+
+# extracting variable vectors
+vec_bio <- data.frame(scores(bio_sig, display='bp'))
+vec_sed <- data.frame(scores(sed_sig, display='bp'))
+
+# labing vectos
+arrowdf_bio <- data.frame(labels = rownames(vec_bio), vec_bio)
+arrowdf_sed <- data.frame(labels = rownames(vec_sed), vec_sed)
+
+# setting arrows
+arrow_map <- aes(xend = CAP1*6.162525, yend = CAP2*6.162525, x = 0, y = 0, shape = NULL, color = NULL, label = labels)
+label_map <- aes(x = CAP1*7, y = CAP2*7, shape = NULL, color = NULL, label = labels)
+arrowhead = arrow(length = unit(0.02, "npc"))
+
+# Plotting
+
+plot_bio<- ggplot(sit_bio, aes(x=CAP1, y=CAP2, color= type, shape= matrix)) +
+  geom_point(size=3) + 
+  scale_color_manual(values=c("#228B22", "#56B4E9", "#E69F00"))+
+  geom_text(aes(label= site),hjust=-0.2, vjust=-1.5, size=3)+
+  theme_bw()+
+  geom_segment(mapping = arrow_map, size = .5, data = arrowdf_bio, color = "black", arrow = arrowhead) + 
+  geom_text(mapping = label_map, size = 4,  data = arrowdf_bio, show.legend = FALSE)+
+  labs(title="A) db-RDA biofilm communities") +
+  labs(x = paste("PCoA 1 (", round(perc_bio[[1]],1), "%", ")", sep = ""),
+       y = paste("PCoA 2 (", round(perc_bio[[2]],1), "%", ")", sep = ""))+
+  theme(legend.position="none")
+
+plot_sed<- ggplot(sit_sed, aes(x=CAP1, y=CAP2, color= type, shape= matrix)) +
+  geom_point(size=3) + 
+  scale_color_manual(values=c("#228B22", "#56B4E9", "#E69F00"))+
+  geom_text(aes(label= site),hjust=-0.2, vjust=-1.5, size=3)+
+  theme_bw()+
+  geom_segment(mapping = arrow_map, size = .5, data = arrowdf_sed, color = "black", arrow = arrowhead) + 
+  geom_text(mapping = label_map, size = 4,  data = arrowdf_sed, show.legend = FALSE)+
+  labs(title="B) db-RDA sediment communities") +
+  labs(x = paste("PCoA 1 (", round(perc_sed[[1]],1), "%", ")", sep = ""),
+       y = paste("PCoA 2 (", round(perc_sed[[2]],1), "%", ")", sep = ""))+
+  theme(legend.position="none")
+
+grid.arrange(plot_bio, plot_sed, ncol = 2)
+
+rm(arrowdf_bio, arrowdf_sed, arrow_map, arrowhead, label_map, sit_bio, sit_sed, spp_bio, spp_sed, vec_bio, vec_sed)
+
+```
+
+#### Remarks regarding beta-diversity
+
+- The role of environmental variables explaining the observed variance was only assessed in biofilm and sediment
+- We created final dbRDA models containing only significant variables
+- Nutrients represented by nitrate and light intensity were two variables explaining most of the variation in biofilms
+  - Light intensity was significantly correlated with reference sites and one of the tributary sites (T2)
+  - Nitrate correlated with the main river course and the rest of the tributary sites
+- Sediment variation was explained by several variables, all of them significant
+  - Light intensity correlated with reference sites likewise in biofilms
+  - Several nutrients played an explanatory role only in tributary sites
+  - Antibacterial pressure, TU_MIC, correlated with the main river course, particularly the head and middle waters within the river basin
+
+### Differential abundance analysis (DAA)
+
+DAA aims to find the differences in the abundance of each taxa between two samples, assigning a significance value to each comparison. DAA tool can help identify highly confident microbial candidates for further biological validation.
+
+The DAA is based on the outputs from the dbRDA analysis where TU_MIC correlated with two sites in the main river course (R1 and R2) in sediments. Thus, comparisons are conducted between the reference sites and R1 and R2 (i.e., Reference vs R1 & Reference vs R2) to identified taxa being promoted and diminished.
+
+```{r, fig.daa, message=FALSE, warning=FALSE, fig.width=10, fig.height=10}
+
+# Sites to test based on dbRDA
+# SEDIMENT Reference vs R1
+
+DESeqSed<- subset_samples(OBJS1, matrix == "Sediment")
+
+#convert phyloseq to deseq2 format
+deseq_sed_sites = phyloseq_to_deseq2(DESeqSed, ~ label)
+
+#remove genus without any counts
+ds_sed_sites<- deseq_sed_sites[rowSums(counts(deseq_sed_sites)) > 0,]
+
+# calculate geometric means prior to estimate size factors
+geoMeans_sed_sites = apply(counts(ds_sed_sites), 1, geo_mean)
+
+#calculate the size factor and add it to the data set
+ds_sed_sites = estimateSizeFactors(ds_sed_sites, geoMeans = geoMeans_sed_sites)
+
+# run deseq
+# Note: The default multiple-inference correction is Benjamini-Hochberg, and occurs within the DESeq function.
+DESeq_sed_sites = DESeq(ds_sed_sites, test="Wald", fitType="parametric")
+
+# result summary overall comparison
+res_desq_sed_sites = results(DESeq_sed_sites)
+
+# results summary for selected sites
+DESeq_sed_RefR1<- results(DESeq_sed_sites, contrast= c("label", "RS1", "R1"), cooksCutoff= FALSE, pAdjustMethod= "BH")
+DESeq_sed_RefR2<- results(DESeq_sed_sites, contrast= c("label", "RS1", "R2"), cooksCutoff= FALSE, pAdjustMethod= "BH")
+
+#order
+DESeq_sed_RefR1 = DESeq_sed_RefR1[order(DESeq_sed_RefR1$padj, na.last=NA), ]
+DESeq_sed_RefR2 = DESeq_sed_RefR2[order(DESeq_sed_RefR2$padj, na.last=NA), ]
+
+# subset for further volcano figure only
+volsed_REFR1 = cbind(as(DESeq_sed_RefR1, "data.frame"), as(tax_table(DESeqSed)[rownames(DESeq_sed_RefR1), ], "matrix"))
+volsed_REFR2 = cbind(as(DESeq_sed_RefR2, "data.frame"), as(tax_table(DESeqSed)[rownames(DESeq_sed_RefR2), ], "matrix"))
+
+# cutt-off p-value
+alpha = 0.01
+
+# filter only significantly abundance
+sig_sed_RefR1 = DESeq_sed_RefR1[(DESeq_sed_RefR1$padj < alpha), ] 
+sig_sed_RefR2 = DESeq_sed_RefR2[(DESeq_sed_RefR2$padj < alpha), ] 
+
+# only significant sites to dataframe
+DFsig_sed_RefR1= cbind(as(sig_sed_RefR1, "data.frame"), as(tax_table(DESeqSed)[rownames(sig_sed_RefR1), ], "matrix"))
+DFsig_sed_RefR2= cbind(as(sig_sed_RefR2, "data.frame"), as(tax_table(DESeqSed)[rownames(sig_sed_RefR2), ], "matrix"))
+
+# phyla order
+x_sRefR1 = tapply(DFsig_sed_RefR1$log2FoldChange, DFsig_sed_RefR1$phylum, function(x) max(x))
+x_sRefR2 = tapply(DFsig_sed_RefR2$log2FoldChange, DFsig_sed_RefR2$phylum, function(x) max(x))
+
+x_sRefR1 = sort(x_sRefR1, TRUE)
+x_sRefR2 = sort(x_sRefR2, TRUE)
+
+DFsig_sed_RefR1$phylum = factor(as.character(DFsig_sed_RefR1$phylum), levels=names(x_sRefR1))
+DFsig_sed_RefR2$phylum = factor(as.character(DFsig_sed_RefR2$phylum), levels=names(x_sRefR2))
+
+# Genus order
+x_sRefR1 = tapply(DFsig_sed_RefR1$log2FoldChange, DFsig_sed_RefR1$genus, function(x) max(x))
+x_sRefR2 = tapply(DFsig_sed_RefR2$log2FoldChange, DFsig_sed_RefR2$genus, function(x) max(x))
+
+x_sRefR1 = sort(x_sRefR1, TRUE)
+x_sRefR2 = sort(x_sRefR2, TRUE)
+
+DFsig_sed_RefR1$genus = factor(as.character(DFsig_sed_RefR1$genus), levels=names(x_sRefR1))
+DFsig_sed_RefR2$genus = factor(as.character(DFsig_sed_RefR2$genus), levels=names(x_sRefR2))
+
+# plotting
+
+sed_RefR1<-ggplot(volsed_REFR1, aes(y= -log(padj), x=log2FoldChange)) + 
+  geom_point(shape=1 , size= 1) +
+  geom_point(data = DFsig_sed_RefR1, aes(y= -log(padj), x=log2FoldChange, col= genus), size=3)+
+  geom_vline(xintercept = 0.0, color = "gray", size = 0.5) +
+  lims(x = c(-22, 22), y = c(0, 20))+
+  geom_text_repel(data= DFsig_sed_RefR1, aes(y= -log(padj), x=log2FoldChange, label=genus),box.padding= 0.2, max.overlaps= 50, min.segment.length= 0, size= 3.5) +
+  ggtitle("Differential abundance Reference vs R1")+
+  facet_wrap( ~ kingdom, scales = "free", ncol = 2) +
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))+
+  theme_bw() + theme(legend.position="none")
+
+sed_RefR2<-ggplot(volsed_REFR2, aes(y= -log(padj), x=log2FoldChange)) + 
+  geom_point(shape=1 , size= 1) +
+  geom_point(data = DFsig_sed_RefR2, aes(y= -log(padj), x=log2FoldChange, col= genus), size=3)+
+  geom_vline(xintercept = 0.0, color = "gray", size = 0.5) +
+  lims(x = c(-22, 22), y = c(0, 20))+
+  geom_text_repel(data= DFsig_sed_RefR2, aes(y= -log(padj), x=log2FoldChange, label=genus),box.padding= 0.2, max.overlaps= 50, min.segment.length= 0, size= 3.5) +
+  ggtitle("Differential abundance Reference vs R2")+
+  facet_wrap( ~ kingdom, scales = "free", ncol = 2) +
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))+
+  theme_bw() + theme(legend.position="none")
+
+grid.arrange(sed_RefR1, sed_RefR2, ncol = 1)
+
+# Clean table with DAA taxa
+CleanListRefR1<- volsed_REFR1 %>%
+  rownames_to_column("OTU") %>%
+  select(OTU, baseMean, log2FoldChange, lfcSE, padj, kingdom, phylum, genus, species) %>%
+  add_column(Comparison="RefvsR1")%>%
+  filter(!genus == "NA") %>%
+  filter (! duplicated(genus)) %>%
+  filter(padj < 0.01) %>%
+  arrange(desc(log2FoldChange))
+
+CleanListRefR2<- volsed_REFR2 %>%
+  rownames_to_column("OTU") %>%
+  select(OTU, baseMean, log2FoldChange, lfcSE, padj, kingdom, phylum, genus, species) %>%
+  add_column(Comparison="RefvsR2")%>%
+  filter(!genus == "NA") %>%
+  filter (! duplicated(genus)) %>%
+  filter(padj < 0.01) %>%
+  arrange(desc(log2FoldChange))
+
+# merged both sets in order to plot facet_wrap
+DAA_table<- bind_rows(CleanListRefR1, CleanListRefR2)
+DAA_table
+
+  
+```
+
+### Microbial function prediction
+
+The database FAPROTAX was used to predict the biochemical cycles of environmental samples and analyze the metabolic function of bac terial communities. FAPROTAX database was created based on the information from the Bergey’s Manual of Systematic Bacteriology and related literatures, so the result of prokaryotic trait identification is reliable and conservative
+
+FAPROTAX automatically match the taxonomic assignments of OTUs against the taxonomic information of the FAPROTAX database (Louca et al., [2016](https://doi.org/10.1126/science.aaf4507)).
+
+```{r, message=FALSE}
+
+# Define a function to process data
+process_data <- function(dataset, matrix_name) {
+  # Conversion of phyloseq to microtable object
+  meco_dataset <- phyloseq2meco(dataset)
+  
+  # Create object of trans_func
+  t2 <- trans_func$new(meco_dataset)
+  t2$for_what <- "prok"
+  
+  # Mapping the taxonomy to the database
+  t2$cal_spe_func(prok_database = "FAPROTAX")
+  
+  # Calculate the percentages for communities
+  t2$cal_spe_func_perc(abundance_weighted = TRUE)
+  
+  # Return the result
+  return(data.frame(matrix = matrix_name, res_spe_func_perc = t2$res_spe_func_perc))
+}
+
+# Process data for each type
+Function_water <- process_data(OBJwater, "Water")
+Function_biofilm <- process_data(OBJbiofilm, "Biofilm")
+Function_sedim <- process_data(OBJsed, "Sediment")
+
+remove_prefix <- function(x) {
+  str_replace(x, "^[^.]+\\.", "")
+}
+
+# Rename columns using the remove_prefix function
+Function_water <- Function_water %>%
+  rename_all(remove_prefix)
+Function_biofilm <- Function_biofilm %>%
+  rename_all(remove_prefix)
+Function_sedim <- Function_sedim %>%
+  rename_all(remove_prefix)
+
+
+```
+
+```{r}
+
+# Create a function for renaming and restructuring data
+rename_and_restructure <- function(data) {
+  col_names <- colnames(data)
+  col_names <- str_replace_all(col_names, "_", " ")
+  col_names <- str_replace(col_names, "^\\w{1}", toupper)
+  
+  data <- data %>%
+    setNames(col_names) %>%
+    rownames_to_column(var = "sample_id") %>%
+    select(sample_id, everything())
+  
+  return(data)
+}
+
+# Apply the function to each dataset
+Function_water <- rename_and_restructure(Function_water)
+Function_sedim <- rename_and_restructure(Function_sedim)
+Function_biofilm <- rename_and_restructure(Function_biofilm)
+
+```
+
+```{r, warning=FALSE}
+
+pivot_and_scale <- function(data, cols_to_pivot) {
+  data <- pivot_longer(data, cols = all_of(cols_to_pivot), names_to = "pathways", values_to = "values") %>%
+    filter(values > 0) %>%
+    mutate(values = values / 100)
+  return(data)
+}
+
+col.order_water <- colnames(Function_water)[3:71]
+col.order_biofilm <- colnames(Function_biofilm)[3:55]
+col.order_sedim <- colnames(Function_sedim)[3:70]
+
+
+Function2_water <- pivot_and_scale(Function_water, col.order_water)
+Function2_biofilm <- pivot_and_scale(Function_biofilm, col.order_biofilm)
+Function2_sedim <- pivot_and_scale(Function_sedim, col.order_sedim)
+
+```
+
+```{r}
+
+label_sites <- function(data) {
+  data <- data %>%
+    mutate(site = case_when(
+      startsWith(sample_id, "RS") ~ "RS",
+      startsWith(sample_id, "R") ~ "R",
+      startsWith(sample_id, "T") ~ "T"
+    ))
+  return(data)
+}
+
+Function3_water <- label_sites(Function2_water)
+Function3_sedim <- label_sites(Function2_sedim)
+Function3_biofilm <- label_sites(Function2_biofilm)
+
+```
+
+Pathways belonging to parasites and human-related were excluded.
+
+```{r}
+calculate_means <- function(data) {
+  data <- data %>%
+    select(-sample_id) %>%
+    group_by(Matrix, site, pathways) %>%
+    summarise(
+      mean = exp(mean(log(values))),
+      sd = sd(values)
+    )
+  return(data)
+}
+
+Function4_water <- calculate_means(Function3_water)
+Function4_sedim <- calculate_means(Function3_sedim)
+Function4_biofilm <- calculate_means(Function3_biofilm)
+
+# Merge the cleaned data frames
+Function_all <- bind_rows(Function4_water, Function4_sedim, Function4_biofilm) %>%
+  filter(!pathways %in% c("Animal parasites or symbionts", "Human gut", "Intracellular parasites", "Predatory or exoparasitic", "Human pathogens all", "Mammal gut", "Invertebrate parasites", "Human associated", "Human pathogens nosocomia", "Human pathogens pneumonia", "Human pathogens septicemia"))
+
+```
+
+#### Ecological functioning related to degradation
+
+```{r, fig_func_degradation, fig.width=8, fig.height=4}
+
+# Define the order of levels for factors
+site.order <- c("RS", "R", "T")
+path.degradation <- c("Aliphatic non methane hydrocarbon degradation", "Aromatic compound degradation", "Aromatic hydrocarbon degradation", "Hydrocarbon degradation", "Plastic degradation")
+
+# Define custom fill colors
+custom_colors <- c("RS" = "#228B22", "T" = "#E69F00", "R" = "#56B4E9")
+
+# Plot the data
+Function_all %>%
+  mutate(Matrix = factor(Matrix, levels = c("Water", "Biofilm", "Sediment")),
+         site = factor(site, levels = rev(site.order))) %>%
+  filter(pathways %in% path.degradation) %>%
+  ggplot(aes(x = pathways, y = mean, fill = site)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_errorbar(aes(ymin = mean, ymax = mean + sd), position = "dodge") +
+  labs(y = "Relative abundance", x = "Bacterial ecological functions") +
+  facet_wrap(vars(Matrix)) +
+  theme_bw() +
+  coord_flip() +
+  scale_fill_manual(values = custom_colors)+  # Assign custom colors to site levels
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_text(angle=40,hjust=0.98,size=rel(1)),
+        axis.text.y=element_text(size=rel(1)))
+
+
+```
+
+- Pathways related to degradation made up to 5% of the predicted functions.
+- If we consider the functional % in the reference sites as an acceptable values, we observed several decrease.
+  - Hydrocarbon degradation drops in both water and biofilm comparments.
+  - Aromatic compound degradation drops in both water and sediment compartments.
+
+#### Ecological nitrogen functioning
+
+```{r, fig_func_nitrogen, fig.width=8, fig.height=4}
+
+path.nitrogen<- c("Aerobic ammonia oxidation", "Aerobic nitrite oxidation", "Anammox", "Denitrification", "Nitrate ammonification", "Nitrate denitrification", "Nitrate reduction", "Nitrate respiration", "Nitrification", "Nitrite ammonification", "Nitrite denitrification", "Nitrite respiration", "Nitrogen fixation", "Nitrogen respiration", "Nitrous oxide denitrification")
+
+# Plot the data
+Function_all %>%
+  mutate(Matrix = factor(Matrix, levels = c("Water", "Biofilm", "Sediment")),
+         site = factor(site, levels = rev(site.order))) %>%
+  filter(pathways %in% path.nitrogen) %>%
+  ggplot(aes(x = pathways, y = mean, fill = site)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_errorbar(aes(ymin = mean, ymax = mean + sd), position = "dodge") +
+  labs(y = "Relative abundance", x = "Bacterial ecological functions") +
+  facet_wrap(vars(Matrix)) +
+  theme_bw() +
+  coord_flip() +
+  scale_fill_manual(values = custom_colors)+  # Assign custom colors to site levels
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_text(angle=40,hjust=0.98,size=rel(1)),
+        axis.text.y=element_text(size=rel(1)))
+```
+
+- Nitrogen related pathways made up to 15% of the predictions
+- We observed again functional drops from reference levels.
+  - Nitrogen nitrite, nitrate respiration in water
+  - Nitrogen fixation in all compartments
+  - 
+- Increases were also determined from reference conditions.
+  - Nitrogen, nitrite, nitrate respiration in sediment
+  - Overall increase nitrification in all compartments
+
+#### Ecological methane functioning
+
+```{r, fig_func_methane, fig.width=8, fig.height=4}
+
+path.methane<- c("Acetoclastic methanogenesis", "Hydrogenotrophic methanogenesis", "Methanogenesis", "Methanogenesis by CO2 reduction with H2", "Methanotrophy")
+
+# Plot the data
+Function_all %>%
+  mutate(Matrix = factor(Matrix, levels = c("Water", "Biofilm", "Sediment")),
+         site = factor(site, levels = rev(site.order))) %>%
+  filter(pathways %in% path.methane) %>%
+  ggplot(aes(x = pathways, y = mean, fill = site)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_errorbar(aes(ymin = mean, ymax = mean + sd), position = "dodge") +
+  labs(y = "Relative abundance", x = "Bacterial ecological functions") +
+  facet_wrap(vars(Matrix)) +
+  theme_bw() +
+  coord_flip() +
+  scale_fill_manual(values = custom_colors)+  # Assign custom colors to site levels
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_text(angle=40,hjust=0.98,size=rel(1)),
+        axis.text.y=element_text(size=rel(1)))
+```
+
+#### Energy sources related pathways
+
+```{r, fig_func_energy, fig.width=8, fig.height=4}
+
+path.energy<- c("Aerobic chemoheterotrophy", "Anaerobic chemoheterotrophy", "Anoxygenic photoautotrophy S oxidizing", "Arsenate respiration", "Fermentation", "Fumarate respiration", "Iron respiration", "Methylotrophy", "Oxygenic photoautotrophy", "Photoheterotrophy", "Photosynthetic cyanobacteria", "Phototrophy", "Respiration of sulfur compounds", "Sulfate respiration", "Sulfite respiration", "Thiosulfate respiration")
+
+
+# Plot the data
+Function_all %>%
+  mutate(Matrix = factor(Matrix, levels = c("Water", "Biofilm", "Sediment")),
+         site = factor(site, levels = rev(site.order))) %>%
+  filter(pathways %in% path.energy) %>%
+  ggplot(aes(x = pathways, y = mean, fill = site)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_errorbar(aes(ymin = mean, ymax = mean + sd), position = "dodge") +
+  labs(y = "Relative abundance", x = "Bacterial ecological functions") +
+  facet_wrap(vars(Matrix)) +
+  theme_bw() +
+  coord_flip() +
+  scale_fill_manual(values = custom_colors)+  # Assign custom colors to site levels
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_text(angle=40,hjust=0.98,size=rel(1)),
+        axis.text.y=element_text(size=rel(1)))
+```
+
+- Energy-related pathways made most of the functioning
+- Photo-related pathways decreased from reference conditions in biofilms and increased in the water compartment.
+- Chemo-related pathways remained stable or slight increases were observed from reference conditions in water and biofilm.
+
+#### Other-related pathways
+
+```{r, fig_func_other, fig.width=8, fig.height=4}
+
+path.other<- c("Cellulolysis", "Chitinolysis", "Chlorate reducers", "Dark hydrogen oxidation", "Dark iron oxidation", "Dark oxidation of sulfur compounds", "Dark sulfide oxidation", "Dark sulfur oxidation", "Dark thiosulfate oxidation", "Dissimilatory arsenate reduction", "Manganese oxidation", "Methanol oxidation", "Ureolysis", "Xylanolysis")
+path.redundant<- c("Chemoheterotrophy", "Photoautotrophy", "Phototrophy")
+
+# Plot the data
+Function_all %>%
+  mutate(Matrix = factor(Matrix, levels = c("Water", "Biofilm", "Sediment")),
+         site = factor(site, levels = rev(site.order))) %>%
+  filter(pathways %in% path.other) %>%
+  filter(!pathways %in% path.redundant) %>%
+  ggplot(aes(x = pathways, y = mean, fill = site)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_errorbar(aes(ymin = mean, ymax = mean + sd), position = "dodge") +
+  labs(y = "Relative abundance", x = "Bacterial ecological functions") +
+  facet_wrap(vars(Matrix)) +
+  theme_bw() +
+  coord_flip() +
+  scale_fill_manual(values = custom_colors)+  # Assign custom colors to site levels
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_text(angle=40,hjust=0.98,size=rel(1)),
+        axis.text.y=element_text(size=rel(1)))
+
+```
+

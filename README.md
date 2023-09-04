@@ -3,3 +3,6 @@ This repository contains the raw data, R-script, and figures from the analysis o
 
 **MicrobialCommunity_vRepo.Rmd**
 R-markdown file containing code and results.
+
+**MicrobialCommunity_vRepo.html**
+Output HTML from R-markdown.

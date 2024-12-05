@@ -6,3 +6,5 @@ R-markdown file containing code and results.
 
 **MicrobialCommunity_vRepo.html**
 Output HTML from R-markdown.
+
+Repository relate to the manuscript: "Multi-compartment impact of micropollutants and particularly antibiotics on bacterial communities using environmental DNA at river basin-level" publised in Environmental pollution (
